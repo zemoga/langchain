@@ -11,7 +11,7 @@
 
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Union, Callable
 
 from pydantic import BaseModel, root_validator, validator
 
@@ -19,6 +19,58 @@ from langchain.docstore.document import Document
 from langchain.document_loaders.base import BaseLoader
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+
+
+# def json_extract(obj: Any, key: Pattern) -> List:
+def json_extract(json_object, key, tx_fn: Callable = lambda val: val):
+    """Recursively fetch values from nested JSON and returns transformation applied over value."""
+    arr = []
+
+    def extract(json_object, arr, key):
+        """Recursively search for values of key in JSON tree."""
+        if isinstance(json_object, dict):
+            for k, v in json_object.items():
+                if isinstance(v, (dict, list)):
+                    extract(v, arr, key)
+                elif k == key:
+                    arr.append(tx_fn(v))
+        elif isinstance(json_object, list):
+            for item in json_object:
+                extract(item, arr, key)
+        return arr
+
+    values = extract(json_object, arr, key)
+
+    return values
+
+
+def _build_slide_metadata(presentation: Dict[str, Any], slide: Dict[str, Any], idx: int) -> Dict:
+    slide_notes = slide.get("slideProperties", {
+        "notesPage": {}
+    }).get("notesPage", {})
+    notes_contents = json_extract(
+        json_object=slide_notes,
+        key="content",
+        tx_fn=lambda val: val.strip('\n+\r+\t+'),
+    )
+    # clean up the notes from empty lines
+    filtered_notes_contents = list(
+        filter(lambda txt: bool(txt.strip()), notes_contents))
+    sId = slide.get("objectId")
+    pId = presentation.get("presentationId")
+
+    return {
+        "id": slide['objectId'],
+        "source": (
+            f"https://docs.google.com/presentation/d/{pId}/"
+            f"edit#slide=id.{sId}"
+        ),
+        "notes": "\n".join(filtered_notes_contents),
+        "position": idx,
+        "presentation_id": pId,
+        "presentation_title": presentation.get("title"),
+        "presentation_source": f"https://docs.google.com/presentation/d/{pId}/",
+    }
 
 
 class GoogleDriveLoader(BaseLoader, BaseModel):
@@ -77,6 +129,7 @@ class GoogleDriveLoader(BaseLoader, BaseModel):
                 "document": "application/vnd.google-apps.document",
                 "sheet": "application/vnd.google-apps.spreadsheet",
                 "pdf": "application/pdf",
+                "presentation": "application/vnd.google-apps.presentation",
             }
             allowed_types = list(type_mapping.keys()) + list(type_mapping.values())
             short_names = ", ".join([f"'{x}'" for x in type_mapping.keys()])
@@ -148,6 +201,26 @@ class GoogleDriveLoader(BaseLoader, BaseModel):
                 token.write(creds.to_json())
 
         return creds
+    
+    """New load method to be able to load slides from Google Drive"""
+    def _load_presentation_from_id(self, id: str) -> List[Document]:
+        """Load a slides from an ID."""
+        import json
+        from googleapiclient.discovery import build
+
+        creds = self._load_credentials()
+        slides_service = build("slides", "v1", credentials=creds)
+        presentation = slides_service.presentations().get(presentationId=id).execute()
+        slides = presentation.get("slides", [])
+        documents = []
+        for idx, slide in enumerate(slides, start=1):
+            slide_elements = slide.get("pageElements", {})
+            elements_contents = json_extract(slide_elements, "content")
+            page_content = "\n".join(elements_contents)
+            metadata = _build_slide_metadata(presentation, slide, idx)
+            documents.append(Document(page_content=page_content, metadata=metadata))
+
+        return documents
 
     def _load_sheet_from_id(self, id: str) -> List[Document]:
         """Load a sheet and all tabs from an ID."""
@@ -226,7 +299,10 @@ class GoogleDriveLoader(BaseLoader, BaseModel):
     def _load_documents_from_folder(
         self, folder_id: str, *, file_types: Optional[Sequence[str]] = None
     ) -> List[Document]:
-        """Load documents from a folder."""
+        """Load documents from a folder.
+        Changes to original loader:
+        - updated file types list to include slides as valid type
+        """
         from googleapiclient.discovery import build
 
         creds = self._load_credentials()
@@ -243,14 +319,20 @@ class GoogleDriveLoader(BaseLoader, BaseModel):
             if file["trashed"] and not self.load_trashed_files:
                 continue
             elif file["mimeType"] == "application/vnd.google-apps.document":
-                returns.append(self._load_document_from_id(file["id"]))  # type: ignore
+                returns.append(self._load_document_from_id(
+                    file["id"]))  # type: ignore
             elif file["mimeType"] == "application/vnd.google-apps.spreadsheet":
-                returns.extend(self._load_sheet_from_id(file["id"]))  # type: ignore
+                returns.extend(self._load_sheet_from_id(
+                    file["id"]))  # type: ignore
+            elif file["mimeType"] == "application/vnd.google-apps.presentation":
+                returns.extend(self._load_presentation_from_id(
+                    file["id"]))  # type: ignore
             elif (
                 file["mimeType"] == "application/pdf"
                 or self.file_loader_cls is not None
             ):
-                returns.extend(self._load_file_from_id(file["id"]))  # type: ignore
+                returns.extend(self._load_file_from_id(
+                    file["id"]))  # type: ignore
             else:
                 pass
         return returns
